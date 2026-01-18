@@ -1,0 +1,5 @@
+flask==3.0.0
+flask-socketio==5.3.5
+eventlet==0.35.1
+numpy==1.26.2
+openai==1.12.0

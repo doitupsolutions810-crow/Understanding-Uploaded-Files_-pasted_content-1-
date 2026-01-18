@@ -1,0 +1,15 @@
+version: '3.9'
+
+services:
+  cyclekernel:
+    build: .
+    container_name: cyclekernel_buildA_FH
+    ports:
+      - "5000:5000"  # Dashboard + Chat endpoint
+    environment:
+      CK_EPOCH_DELAY: 5      # Seconds per simulation epoch
+      CK_UNIVERSES: 2        # Number of parallel universes
+      OPENAI_API_KEY: ${OPENAI_API_KEY}  # Pass from host environment
+    volumes:
+      - ./logs:/app/logs     # Persistent log storage
+    restart: unless-stopped
