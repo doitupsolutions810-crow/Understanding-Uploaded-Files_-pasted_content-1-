@@ -18,13 +18,10 @@ from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit
 from datetime import datetime
 
-# ---------------- ENVIRONMENT VARIABLES ----------------
-EPOCH_DELAY = float(os.environ.get("CK_EPOCH_DELAY", 5))  # seconds per epoch
-NUM_UNIVERSES = int(os.environ.get("CK_UNIVERSES", 2))
+# ---------------- LOGGING ----------------
 LOG_PATH = os.path.join(os.getcwd(), "logs")
 os.makedirs(LOG_PATH, exist_ok=True)
 
-# ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -34,6 +31,19 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger("CycleKernel")
+
+# ---------------- ENVIRONMENT VARIABLES ----------------
+EPOCH_DELAY = float(os.environ.get("CK_EPOCH_DELAY", 5))  # seconds per epoch
+NUM_UNIVERSES = int(os.environ.get("CK_UNIVERSES", 2))
+SEED = os.environ.get("CK_SEED")
+if SEED:
+    try:
+        s = int(SEED)
+        random.seed(s)
+        np.random.seed(s)
+        log.info(f"RNG seeded with CK_SEED: {s}")
+    except ValueError:
+        log.warning(f"Invalid CK_SEED: {SEED}. Using random seed.")
 
 # ---------------- FLASK / SOCKETIO ----------------
 app = Flask(__name__)
@@ -143,7 +153,8 @@ class ChatMemoryBridge:
         self.kernel = kernel
         self.universes = universes
         self.chat_to_civ_map = {}
-        
+        self.conversation_history = {} # userid -> list of {"role":, "content":}
+
     def process_interaction(self, user_id, message, response):
         u1 = self.universes.get("U1")
         if not u1: return
@@ -158,9 +169,25 @@ class ChatMemoryBridge:
         civ["resources"]["attention"] = min(150, civ["resources"]["attention"] + 10)
         civ["resources"]["compute"] += 5
         
-        # Influence belief based on message length and sentiment (mock)
-        civ["belief"]["truth"] = np.clip(civ["belief"]["truth"] + (len(message)/1000), 0, 1)
+        # Influence belief based on sentiment and length
+        sentiment_score = 0
+        positive_keywords = ["truth", "real", "stable", "growth", "yes", "agree"]
+        negative_keywords = ["fake", "lie", "chaos", "decay", "no", "reject"]
+        
+        lower_msg = message.lower()
+        for w in positive_keywords: 
+            if w in lower_msg: sentiment_score += 0.05
+        for w in negative_keywords: 
+            if w in lower_msg: sentiment_score -= 0.05
+            
+        civ["belief"]["truth"] = np.clip(civ["belief"]["truth"] + sentiment_score + (len(message)/2000), 0, 1)
         civ["belief"]["deception"] = 1 - civ["belief"]["truth"]
+        
+        # Update History
+        if user_id not in self.conversation_history: self.conversation_history[user_id] = []
+        self.conversation_history[user_id].append({"role":"user", "content":message})
+        self.conversation_history[user_id].append({"role":"assistant", "content":response})
+        self.conversation_history[user_id] = self.conversation_history[user_id][-10:] # Keep last 10
         
         event = {
             "type": "chat_interaction",
@@ -174,8 +201,14 @@ class ChatMemoryBridge:
 
     def get_context_from_memory(self, user_id):
         civ_id = self.chat_to_civ_map.get(user_id)
-        if not civ_id: return "New user, no prior memory."
         u1 = self.universes.get("U1")
+        if not civ_id or not u1:
+            return {
+                "user_state": None,
+                "crystallized_memories": [],
+                "universe_vibe": {"total_civs": len(u1.civilizations) if u1 else 0, "active_factions": len(u1.factions) if u1 else 0},
+                "status": "New user or universe not found"
+            }
         civ = u1.civilizations.get(civ_id)
         related_myths = [m for m in u1.myths.values() if m["faction"] == civ["faction"]] if civ else []
         return {
@@ -287,18 +320,21 @@ def markets(u,epoch):
                 socketio.emit("event", {"message":f"{u.name}: market resolved"})
 
 def lifecycle(u, epoch):
+    # Removal logic for long-dead nodes moved to simulation_loop cleanup phase
     for c in list(u.civilizations.values()):
-        if not c["alive"]: continue
-        c["age"]+=1
-        c["resources"]["attention"]-=random.uniform(0.5, 1.5) # Slower decay for chatbot users
-        c["resources"]["compute"]-=random.uniform(0.2, 1.0)
-        if c["resources"]["attention"]<5 or c["resources"]["compute"]<2:
-            c["alive"]=False
-            socketio.emit("event", {"message":f"{u.name}: memory node {c['id']} expired"})
+        if not c["alive"]:
+            continue
+        c["age"] += 1
+        c["resources"]["attention"] -= random.uniform(0.5, 1.5)
+        c["resources"]["compute"] -= random.uniform(0.2, 1.0)
+        if c["resources"]["attention"] < 5 or c["resources"]["compute"] < 2:
+            c["alive"] = False
+            c["death_epoch"] = epoch
+            socketio.emit("event", {"message": f"{u.name}: memory node {c['id']} expired"})
             
-    if random.random()<0.1 and len(u.civilizations)<30:
-        new_id=f"civ_{uuid.uuid4().hex[:6]}"
-        u.civilizations[new_id]=civ_template(new_id)
+    if random.random() < 0.1 and len([c for c in u.civilizations.values() if c["alive"]]) < 50:
+        new_id = f"civ_{uuid.uuid4().hex[:6]}"
+        u.civilizations[new_id] = civ_template(new_id)
 
 def extinction_markets_logic(u, epoch):
     if random.random()<0.05:
@@ -329,6 +365,42 @@ def myth_crystallization(u, epoch):
                 for m in members: m["myth_influence"]+=0.1
                 socketio.emit("event", {"message":f"Memory Crystallized: New Myth in {f['name']}"})
 
+def information_hazards(u, epoch):
+    # High truth can become a hazard (viral idea)
+    for c in list(u.civilizations.values()):
+        if not c["alive"]: continue
+        if c["belief"]["truth"] > 0.9 and random.random() < 0.15:
+            # Hazard triggered
+            hazard_strength = random.uniform(0.1, 0.4)
+            c["resources"]["attention"] -= hazard_strength * 20
+            socketio.emit("event", {"message": f"Info Hazard in {c['id']}: Truth Overload! Attention damped."})
+            
+            # Viral spread
+            for other_id, other_c in u.civilizations.items():
+                if other_c["alive"] and other_id != c["id"] and random.random() < 0.3:
+                    other_c["belief"]["truth"] = min(1.0, other_c["belief"]["truth"] + 0.05)
+                    socketio.emit("event", {"message": f"Hazard spreads to {other_id}"})
+
+def inter_civ_trade(u):
+    # Exchange Compute (scare logic) for Attention (popular logic)
+    alive_civs = [c for c in u.civilizations.values() if c["alive"]]
+    random.shuffle(alive_civs)
+    for i in range(0, len(alive_civs) - 1, 2):
+        c1 = alive_civs[i]
+        c2 = alive_civs[i+1]
+        
+        # Simple trade logic
+        if c1["resources"]["compute"] > 50 and c2["resources"]["attention"] > 50:
+            # Trade Compute for Attention
+            amount_comp = 10
+            amount_attn = 15
+            c1["resources"]["compute"] -= amount_comp
+            c1["resources"]["attention"] += amount_attn * 0.9 # Tax
+            c2["resources"]["attention"] -= amount_attn
+            c2["resources"]["compute"] += amount_comp * 0.9 # Tax
+            
+            # socketio.emit("event", {"message": f"Trade: {c1['id']} <-> {c2['id']}"}) # Reduce spam
+
 def auto_proposals(epoch):
     if random.random()<0.1:
         u=random.choice(list(universes.values()))
@@ -352,31 +424,59 @@ def apply_approved_diffs():
 # ---------------- SIMULATION LOOP ----------------
 current_epoch = 0
 simulation_running = False
+simulation_paused = False
+simulation_lock = threading.Lock()
 
 def simulation_loop():
-    global current_epoch, simulation_running
+    global current_epoch, simulation_running, simulation_paused
     simulation_running = True
+    log.info("Simulation loop started.")
     while simulation_running:
-        current_epoch += 1
-        for u in universes.values():
-            assign_factions(u)
-            update_factions(u)
-            divergence_split(u)
-            narrative_escalation(u)
-            exploiter_actions(u)
-            institution_proof(u)
-            inject_signal(u, current_epoch)
-            markets(u, current_epoch)
-            lifecycle(u, current_epoch)
-            extinction_markets_logic(u, current_epoch)
-            myth_crystallization(u, current_epoch)
-        cross_universe_injection()
-        auto_proposals(current_epoch)
-        apply_approved_diffs()
-        for p in list(kernel.proposals):
-            if p["trust_score"]>0.92: kernel.approve_proposal(p["id"])
-        socketio.emit("epoch_update", {"epoch": current_epoch, "summary": get_state_summary()})
-        time.sleep(EPOCH_DELAY)
+        if simulation_paused:
+            time.sleep(1)
+            continue
+        
+        try:
+            current_epoch += 1
+            with simulation_lock:
+                for u in universes.values():
+                    assign_factions(u)
+                    update_factions(u)
+                    divergence_split(u)
+                    narrative_escalation(u)
+                    exploiter_actions(u)
+                    institution_proof(u)
+                    inject_signal(u, current_epoch)
+                    markets(u, current_epoch)
+                    information_hazards(u, current_epoch) # NEW
+                    inter_civ_trade(u)                    # NEW
+                    lifecycle(u, current_epoch)
+                    extinction_markets_logic(u, current_epoch)
+                    myth_crystallization(u, current_epoch)
+                cross_universe_injection()
+                auto_proposals(current_epoch)
+                apply_approved_diffs()
+                for p in list(kernel.proposals):
+                    if p["trust_score"] > 0.92: 
+                        kernel.approve_proposal(p["id"])
+            
+            socketio.emit("epoch_update", {"epoch": current_epoch, "summary": get_state_summary()})
+            
+            # Periodically cleanup dead civilizations (every 5 epochs)
+            if current_epoch % 5 == 0:
+                with simulation_lock:
+                    for u in universes.values():
+                        dead_ids = [cid for cid, c in u.civilizations.items() 
+                                    if not c["alive"] and (current_epoch - c.get("death_epoch", 0)) > 10]
+                        for cid in dead_ids:
+                            del u.civilizations[cid]
+                    log.info(f"Epoch {current_epoch}: Cleanup performed.")
+
+            time.sleep(EPOCH_DELAY)
+        except Exception as e:
+            log.error(f"Error in simulation loop: {e}")
+            time.sleep(2) # Wait a bit before retrying
+    log.info("Simulation loop stopped.")
 
 def get_state_summary():
     summary = {"epoch": current_epoch, "universes": {}}
@@ -413,8 +513,14 @@ RULES:
 def chat():
     try:
         data = request.get_json()
+        if data is None:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
         user_id = data.get("user_id", "default_user")
-        prompt = data.get("prompt", "")
+        prompt = data.get("prompt")
+        
+        if not prompt:
+            return jsonify({"error": "No prompt provided"}), 400
         
         # 1. Get Memory Context
         memory_context = memory_bridge.get_context_from_memory(user_id)
@@ -429,17 +535,25 @@ def chat():
             client = OpenAI(api_key=api_key)
             messages = [
                 {"role": "system", "content": MANUS_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Memory Context: {json.dumps(memory_context)}\n\nUser: {prompt}"}
             ]
+            
+            # Add History
+            history = memory_bridge.conversation_history.get(user_id, [])
+            for msg in history:
+                messages.append(msg)
+                
+            messages.append({"role": "user", "content": f"Memory Context: {json.dumps(memory_context)}\n\nUser: {prompt}"})
+
             response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
             ai_response = response.choices[0].message.content
         else:
             # MOCK MODE FOR TESTING COHERENCE
-            user_state = memory_context.get("user_state", {})
+            user_state = memory_context.get("user_state") or {}
             attn = user_state.get("resources", {}).get("attention", 0)
             comp = user_state.get("resources", {}).get("compute", 0)
             ai_response = (f"[MOCK AI] I perceive you in the simulation. "
-                           f"Your Attention is {attn} and Compute is {comp}. "
+                           f"Your Attention is {attn:.1f} and Compute is {comp:.1f}. "
+                           f"Truth Alignment: {user_state.get('belief',{}).get('truth',0)*100:.1f}%. "
                            f"The loop is cohering. Your specific input '{prompt}' has been crystallized.")
 
         # 3. Update Memory based on interaction
@@ -453,6 +567,9 @@ def chat():
 @app.route("/state", methods=["GET"])
 def get_state(): return jsonify(get_full_state())
 
+@app.route("/proposals", methods=["GET"])
+def get_proposals(): return jsonify(kernel.proposals)
+
 @app.route("/query_llm", methods=["POST"])
 def query_llm():
     """
@@ -460,7 +577,12 @@ def query_llm():
     """
     try:
         data = request.get_json()
-        prompt = data.get("prompt","")
+        if data is None:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        prompt = data.get("prompt")
+        if not prompt:
+            return jsonify({"error": "No prompt provided"}), 400
         
         # 0. Check if OpenAI API Key is set
         if not os.environ.get("OPENAI_API_KEY"):
@@ -491,10 +613,44 @@ def query_llm():
         log.error(f"Query LLM error: {e}")
         return jsonify({"response": f"Error: {str(e)}"}), 500
 
+@app.route("/sim/start", methods=["POST"])
+def start_sim():
+    global simulation_running, simulation_paused
+    if not simulation_running:
+        threading.Thread(target=simulation_loop, daemon=True).start()
+        return jsonify({"status": "started"})
+    elif simulation_paused:
+        simulation_paused = False
+        return jsonify({"status": "resumed"})
+    return jsonify({"status": "already running"})
+
+@app.route("/sim/stop", methods=["POST"])
+def stop_sim():
+    global simulation_running
+    simulation_running = False
+    return jsonify({"status": "stopping"})
+
+@app.route("/sim/pause", methods=["POST"])
+def pause_sim():
+    global simulation_paused
+    simulation_paused = True
+    return jsonify({"status": "paused"})
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "up",
+        "simulation_running": simulation_running,
+        "simulation_paused": simulation_paused,
+        "epoch": current_epoch,
+        "universes": len(universes)
+    })
+
 @app.route("/")
 def index():
     with open("templates/dashboard.html", "r") as f: return render_template_string(f.read())
 
 if __name__ == "__main__":
     threading.Thread(target=simulation_loop, daemon=True).start()
-    socketio.run(app, host="0.0.0.0", port=5001, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)

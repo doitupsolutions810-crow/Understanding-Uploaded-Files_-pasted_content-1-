@@ -5,11 +5,12 @@ services:
     build: .
     container_name: cyclekernel_buildA_FH
     ports:
-      - "5000:5000"  # Dashboard + Chat endpoint
+      - "5001:5000"  # Dashboard + Chat endpoint
     environment:
       CK_EPOCH_DELAY: 5      # Seconds per simulation epoch
       CK_UNIVERSES: 2        # Number of parallel universes
       OPENAI_API_KEY: ${OPENAI_API_KEY}  # Pass from host environment
+      CK_SEED: 42                       # Optional: set for deterministic runs
     volumes:
       - ./logs:/app/logs     # Persistent log storage
     restart: unless-stopped

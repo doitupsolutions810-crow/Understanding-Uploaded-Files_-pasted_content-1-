@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <title>CycleKernel Chatbot - Living Memory</title>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 body { font-family: 'Inter', -apple-system, sans-serif; background: #0a0c10; color: #e6edf3; margin: 0; display: flex; height: 100vh; overflow: hidden; }
 .sidebar { width: 350px; background: #0d1117; border-right: 1px solid #30363d; display: flex; flex-direction: column; padding: 20px; }
@@ -51,14 +52,27 @@ h3 { margin-top: 0; font-size: 16px; color: #79c0ff; }
                 <span class="stat-label">Attention</span>
                 <span class="stat-value" id="user-attn">100</span>
             </div>
+            <div style="background:#30363d; height:4px; border-radius:2px; margin-bottom:8px;">
+                <div id="attn-bar" style="background:#79c0ff; height:100%; width:66%; border-radius:2px; transition:width 0.5s;"></div>
+            </div>
+            
             <div class="stat-row">
                 <span class="stat-label">Compute</span>
                 <span class="stat-value" id="user-comp">100</span>
             </div>
+            <div style="background:#30363d; height:4px; border-radius:2px; margin-bottom:8px;">
+                <div id="comp-bar" style="background:#d2a8ff; height:100%; width:66%; border-radius:2px; transition:width 0.5s;"></div>
+            </div>
+
             <div class="stat-row">
                 <span class="stat-label">Truth Alignment</span>
                 <span class="stat-value" id="user-truth">70%</span>
             </div>
+        </div>
+
+        <h3>📈 Belief Dynamics</h3>
+        <div class="memory-card">
+            <canvas id="beliefChart" height="150"></canvas>
         </div>
 
         <h3>📜 Kernel Events</h3>
@@ -120,9 +134,15 @@ h3 { margin-top: 0; font-size: 16px; color: #79c0ff; }
                 
                 if (data.memory_state && data.memory_state.user_state) {
                     const s = data.memory_state.user_state;
-                    document.getElementById('user-attn').textContent = Math.round(s.resources.attention);
-                    document.getElementById('user-comp').textContent = Math.round(s.resources.compute);
+                    const attn = s.resources.attention;
+                    const comp = s.resources.compute;
+                    
+                    document.getElementById('user-attn').textContent = Math.round(attn);
+                    document.getElementById('user-comp').textContent = Math.round(comp);
                     document.getElementById('user-truth').textContent = Math.round(s.belief.truth * 100) + "%";
+                    
+                    document.getElementById('attn-bar').style.width = Math.min(100, (attn / 150) * 100) + "%";
+                    document.getElementById('comp-bar').style.width = Math.min(100, (comp / 150) * 100) + "%";
                 }
             } catch (e) {
                 appendMessage("Error connecting to memory layer.", false);
@@ -136,11 +156,49 @@ h3 { margin-top: 0; font-size: 16px; color: #79c0ff; }
             const u1 = data.summary.universes.U1;
             document.getElementById('nodes-val').textContent = u1.civilizations_alive;
             document.getElementById('myths-val').textContent = u1.myths;
+            
+            // Update Chart
+            updateChart(data.epoch, u1.civilizations_alive); // Mock data for now, aiming for belief later
         });
 
         socket.on('event', (data) => {
             appendEvent(data.message);
         });
+
+        // Chart Setup
+        const ctx = document.getElementById('beliefChart').getContext('2d');
+        const beliefChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'System Entropy',
+                    data: [],
+                    borderColor: '#79c0ff',
+                    tension: 0.4,
+                    borderWidth: 2,
+                    pointRadius: 0
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { display: false },
+                    y: { display: false, min: 0 }
+                }
+            }
+        });
+
+        function updateChart(label, value) {
+            beliefChart.data.labels.push(label);
+            beliefChart.data.datasets[0].data.push(value);
+            if (beliefChart.data.labels.length > 20) {
+                beliefChart.data.labels.shift();
+                beliefChart.data.datasets[0].data.shift();
+            }
+            beliefChart.update();
+        }
     </script>
 </body>
 </html>
